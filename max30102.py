@@ -1,18 +1,7 @@
 # -*-coding:utf-8-*-
-
-# this code is currently for python 2.7
-from __future__ import print_function
-from time import sleep
-
 import RPi.GPIO as GPIO
 import smbus
 
-# i2c address-es
-# not required?
-I2C_WRITE_ADDR = 0xAE
-I2C_READ_ADDR = 0xAF
-
-# register address-es
 REG_INTR_STATUS_1 = 0x00
 REG_INTR_STATUS_2 = 0x01
 
@@ -30,26 +19,17 @@ REG_SPO2_CONFIG = 0x0A
 REG_LED1_PA = 0x0C
 
 REG_LED2_PA = 0x0D
-REG_PILOT_PA = 0x10
 REG_MULTI_LED_CTRL1 = 0x11
 REG_MULTI_LED_CTRL2 = 0x12
 
 REG_TEMP_INTR = 0x1F
 REG_TEMP_FRAC = 0x20
 REG_TEMP_CONFIG = 0x21
-REG_PROX_INT_THRESH = 0x30
-REG_REV_ID = 0xFE
-REG_PART_ID = 0xFF
-
-# currently not used
-MAX_BRIGHTNESS = 255
-
 
 class MAX30102():
     # by default, this assumes that physical pin 7 (GPIO 4) is used as interrupt
     # by default, this assumes that the device is at 0x57 on channel 1
     def __init__(self, channel=1, address=0x57, gpio_pin=7):
-        print("Channel: {0}, address: 0x{1:x}".format(channel, address))
         self.address = address
         self.channel = channel
         self.bus = smbus.SMBus(self.channel)
@@ -57,80 +37,90 @@ class MAX30102():
 
         # set gpio mode
         GPIO.setmode(GPIO.BOARD)
-        GPIO.setup(self.interrupt, GPIO.IN)
+        GPIO.setup(self.interrupt, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
         self.reset()
 
-        sleep(1)  # wait 1 sec
-
-        # read & clear interrupt register (read 1 byte)
-        reg_data = self.bus.read_i2c_block_data(self.address, REG_INTR_STATUS_1, 1)
-        # print("[SETUP] reset complete with interrupt register0: {0}".format(reg_data))
+        # PWR_RDY
+        # On power-up or after a brownout condition,
+        # when the supply voltage VDD transitions from below the undervoltage lockout(UVLO) voltage to above the UVLO voltage,
+        # a power-ready interrupt is triggered to signal that the module is powered-up and ready to collect data.
+        # After the power is established, an interrupt occurs to alert the system that the MAX30102 is ready for operation.
+        # Reading the I2C interrupt register clears the interrupt.
+        self.bus.read_i2c_block_data(self.address, REG_INTR_STATUS_1, 1)
         self.setup()
-        # print("[SETUP] setup complete")
 
     def shutdown(self):
         """
         Shutdown the device.
         """
+        # SHDN
+        # The part can be put into a power-save mode by setting this bit to one.
+        # While in power-save mode, all registers retain their values, and write/read operations function as normal.
+        # All interrupts are cleared to zero in this mode.
         self.bus.write_i2c_block_data(self.address, REG_MODE_CONFIG, [0x80])
 
     def reset(self):
         """
         Reset the device, this will clear all settings,
         so after running this, run setup() again.
-        """
-        self.bus.write_i2c_block_data(self.address, REG_MODE_CONFIG, [0x40])
 
-    def setup(self, led_mode=0x03):
+        """
+        # RESET
+        # When the RESET bit is set to one,
+        # all configuration, threshold, and data registers are reset to their power-on-state through a power-on reset.
+        # The RESET bit is cleared automatically back to zero after the reset sequence is completed.
+        # Note: Setting the RESET bit does not trigger a PWR_RDY interrupt event.
+        self.bus.write_i2c_block_data(self.address, REG_MODE_CONFIG, [0x40])
+        # Waiting for RESET register turning to 0
+        while(True):
+            res = self.bus.read_i2c_block_data(self.address, REG_MODE_CONFIG, 1)
+            if (res[0] >> 6) & 1 == 0: break
+
+    def setup(self):
         """
         This will setup the device with the values written in sample Arduino code.
         """
         # INTR setting
-        # 0xc0 : A_FULL_EN and PPG_RDY_EN = Interrupt will be triggered when
-        # fifo almost full & new fifo data ready
-        self.bus.write_i2c_block_data(self.address, REG_INTR_ENABLE_1, [0xc0])
+        # 0x40 : PPG_RDY_EN = Interrupt will be triggered when new fifo data ready
+        # In SpO2 and HR modes, this interrupt triggers when there is a new sample in the data FIFO.
+        # The interrupt is cleared by reading the Interrupt Status 1 register (0x00), or by reading the FIFO_DATA register.
+        self.bus.write_i2c_block_data(self.address, REG_INTR_ENABLE_1, [0x40])
         self.bus.write_i2c_block_data(self.address, REG_INTR_ENABLE_2, [0x00])
 
-        # FIFO_WR_PTR[4:0]
+        # When starting a new SpO2 or heart rate conversion,
+        # it is recommended to first clear the FIFO_WR_PTR, OVF_COUNTER, and FIFO_RD_PTR registers
+        # to all zeroes (0x00) to ensure the FIFO is empty and in a known state.
         self.bus.write_i2c_block_data(self.address, REG_FIFO_WR_PTR, [0x00])
-        # OVF_COUNTER[4:0]
         self.bus.write_i2c_block_data(self.address, REG_OVF_COUNTER, [0x00])
-        # FIFO_RD_PTR[4:0]
         self.bus.write_i2c_block_data(self.address, REG_FIFO_RD_PTR, [0x00])
 
-        # 0b 0100 1111
-        # sample avg = 4, fifo rollover = false, fifo almost full = 17
-        self.bus.write_i2c_block_data(self.address, REG_FIFO_CONFIG, [0x4f])
+        SMP_AVE = 0b001 # 2
+        FIFO_ROLLOVER_EN = 0b00 # disable
+        FIFO_A_FULL = 0b00 # 0
+        REG_FIFO_CONFIG_DATA = (SMP_AVE << 5 | FIFO_ROLLOVER_EN << 4 | FIFO_A_FULL)
+        self.bus.write_i2c_block_data(self.address, REG_FIFO_CONFIG, [REG_FIFO_CONFIG_DATA])
 
-        # 0x02 for read-only, 0x03 for SpO2 mode, 0x07 multimode LED
-        self.bus.write_i2c_block_data(self.address, REG_MODE_CONFIG, [led_mode])
-        # 0b 0010 0111
-        # SPO2_ADC range = 4096nA, SPO2 sample rate = 100Hz, LED pulse-width = 411uS
-        self.bus.write_i2c_block_data(self.address, REG_SPO2_CONFIG, [0x27])
+        # 0x02 for HR mode, 0x03 for SpO2 mode, 0x07 multimode LED
+        self.bus.write_i2c_block_data(self.address, REG_MODE_CONFIG, [0x03])
 
-        # choose value for ~7mA for LED1
+        SPO2_ADC_RANGE = 0b01 # 4096nA
+        SPO2_SAMPLE_RATE = 0b011 # 400Hz
+        LED_PULSE_WIDTH = 0b11 # 411us
+        REG_SPO2_CONFIG_DATA = (SPO2_ADC_RANGE << 5 | SPO2_SAMPLE_RATE << 2 | LED_PULSE_WIDTH)
+        self.bus.write_i2c_block_data(self.address, REG_SPO2_CONFIG, [REG_SPO2_CONFIG_DATA])
+
+        # choose value for ~7mA for LED1(Red for SpO2)
         self.bus.write_i2c_block_data(self.address, REG_LED1_PA, [0x24])
-        # choose value for ~7mA for LED2
+        # choose value for ~7mA for LED2(IR for HR)
         self.bus.write_i2c_block_data(self.address, REG_LED2_PA, [0x24])
-        # choose value fro ~25mA for Pilot LED
-        self.bus.write_i2c_block_data(self.address, REG_PILOT_PA, [0x7f])
-
-    # this won't validate the arguments!
-    # use when changing the values from default
-    def set_config(self, reg, value):
-        self.bus.write_i2c_block_data(self.address, reg, value)
 
     def read_fifo(self):
-        """
-        This function will read the data register.
-        """
         red_led = None
         ir_led = None
 
-        # read 1 byte from registers (values are discarded)
-        reg_INTR1 = self.bus.read_i2c_block_data(self.address, REG_INTR_STATUS_1, 1)
-        reg_INTR2 = self.bus.read_i2c_block_data(self.address, REG_INTR_STATUS_2, 1)
+        # The interrupt is cleared by reading the Interrupt Status 1 register
+        self.bus.read_i2c_block_data(self.address, REG_INTR_STATUS_1, 1)
 
         # read 6-byte data from the device
         d = self.bus.read_i2c_block_data(self.address, REG_FIFO_DATA, 6)
@@ -148,10 +138,9 @@ class MAX30102():
         """
         red_buf = []
         ir_buf = []
-        for i in range(amount):
+        for _ in range(amount):
             while(GPIO.input(self.interrupt) == 1):
                 # wait for interrupt signal, which means the data is available
-                # do nothing here
                 pass
 
             red, ir = self.read_fifo()
